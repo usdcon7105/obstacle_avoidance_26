@@ -36,6 +36,7 @@ class FrameHandler: NSObject, ObservableObject {
     public var corridorPosition: String = ""
     public var vert: String = ""
     public var objectIDD: Int = -1
+    private var recentDetections: [DetectionOutput] = []
 //    public var middlePoint: (Int, Int) = ()
     var screenRect: CGRect!
     override init() {
@@ -366,8 +367,16 @@ extension FrameHandler: AVCaptureDataOutputSynchronizerDelegate {
 //        let correctedDepth: Float16 = Float16(meanDistanceMetres)
 //        let averageDepth = count > 0 ? totalDepth / Float16(count) : 0
         let medianDepth = self.findMedian(distances: depthSamples)
-        // This inverts the depth value as the distance is inversed naturally
-        let correctedDepth: Float16 = medianDepth > 0 ? 1.0 / medianDepth : 0
+        
+        //Removes outliers.
+        guard medianDepth > 0.2 && medianDepth < 8.0 else {
+            CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
+    return
+}
+         // This inverts the depth value as the distance is inversed naturally
+        //let correctedDepth: Float16 = medianDepth > 0 ? 1.0 / medianDepth : 0
+        //Replaces let statement above.
+        let correctedDepth: Float16 = medianDepth
         CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
         DispatchQueue.main.async {
             let newDetection = DetectionOutput(objcetName: self.objectName, distance: correctedDepth, corridorPosition: self.corridorPosition, id: self.objectIDD, vert: self.vert)
@@ -381,8 +390,10 @@ extension FrameHandler: AVCaptureDataOutputSynchronizerDelegate {
             for detection in recentDetections {
                 frequency[detection.objcetName, default: 0] += 1
             }
-            let sortedFrequency = frequency.sorted(by: {$0.value < $1.value})
-            let commonLabel = sortedFrequency[0].key
+            //let sortedFrequency = frequency.sorted(by: {$0.value < $1.value})
+            //let commonLabel = sortedFrequency[0].key
+            let sortedFrequency = frequency.sorted(by: {$0.value > $1.value})
+            let commonLabel = sortedFrequency.first?.key ?? self.objectName
             var totalDistance: Float16 = 0
             var finalCount: Float16 = 0
             for detection in recentDetections {
@@ -420,6 +431,7 @@ extension FrameHandler: AVCaptureDataOutputSynchronizerDelegate {
 //            }
         }
     }
+    /*
     func findMedian(distances: [Float16]) -> Float16
     {
         let count = distances.count
@@ -433,6 +445,22 @@ extension FrameHandler: AVCaptureDataOutputSynchronizerDelegate {
             return (lower + upper) / 2
         }
     }
+    */
+    //New function, replaces commented one above - Bilal.
+    func findMedian(distances: [Float16]) -> Float16 {
+    let filtered = distances.filter { $0 > 0 && !$0.isNaN }
+    guard filtered.count > 0 else { return 0 }
+
+    let sorted = filtered.sorted()
+    let count = sorted.count
+
+    if count % 2 == 1 {
+        return sorted[count / 2]
+    } else {
+        return (sorted[count/2 - 1] + sorted[count/2]) / 2
+    }
+}
+    
 }
 extension FrameHandler: AVCaptureVideoDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput,
