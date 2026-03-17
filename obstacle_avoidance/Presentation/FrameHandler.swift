@@ -269,30 +269,19 @@ extension FrameHandler: AVCaptureDataOutputSynchronizerDelegate {
                 self.frame = cgImage
             }
         }
-        //creates array that will hold the recent detections to help us parse out outlers.
-    
-        var recentDetections: [DetectionOutput] = []
         let depthMap = syncedDepthData.depthData.depthDataMap
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         let width = Float(CVPixelBufferGetWidth(depthMap))
         let height = CVPixelBufferGetHeight(depthMap)
         // Lock the pixel address so we are not moving around too much
         //            ($0.rect.width * $0.rect.height) < ($1.rect.width * $1.rect.height)
-        //WE ARE USING SCORE BUT IT SAYS LARGEST
-        guard let largestBox = self.boundingBoxes.max(by: {
-            ($0.score < $1.score)
-        }) else {
-            // No bounding box detected; skip processing.
+        // Process all detections from the current frame instead of only the highest-confidence one.
+        let boxes = self.boundingBoxes
+        guard !boxes.isEmpty else {
             CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
             return
         }
-        boxCenter = CGPoint(x: largestBox.rect.midX, y: largestBox.rect.midY)
-        self.objectName = largestBox.name
-        self.objectCoordinates = largestBox.rect
-        self.confidence = largestBox.score
-        self.corridorPosition = largestBox.direction
-        self.objectIDD = largestBox.classIndex
-        self.vert = largestBox.vert
+
         // Get the baseadress of pixel and turn it into a Float16 so it is readable.
         let baseAddress = unsafeBitCast(
             CVPixelBufferGetBaseAddress(depthMap),
@@ -317,101 +306,93 @@ extension FrameHandler: AVCaptureDataOutputSynchronizerDelegate {
 //                count += 1
 //            }
 //        }
-        //  Compute bounding box corners in screen coordinates
-        let boxMinX = largestBox.rect.minX
-        let boxMaxX = largestBox.rect.maxX
-        let boxMinY = largestBox.rect.minY
-        let boxMaxY = largestBox.rect.maxY
+        // Pre-compute median depths for each bounding box
+        var perBoxDetections: [(box: BoundingBox, medianDepth: Float16)] = []
+        var closestDepthForStress: Float16 = 0
+        var minDistanceForStress: Float = .greatestFiniteMagnitude
 
-        // Convert from screen coordinates to depth-map coordinates
-        let depthMinX = Int((boxMinX / screenRect.width) * CGFloat(width))
-        let depthMaxX = Int((boxMaxX / screenRect.width) * CGFloat(width))
-        let depthMinY = Int((boxMinY / screenRect.height) * CGFloat(height))
-        let depthMaxY = Int((boxMaxY / screenRect.height) * CGFloat(height))
+        for box in boxes {
+            //  Compute bounding box corners in screen coordinates
+            let boxMinX = box.rect.minX
+            let boxMaxX = box.rect.maxX
+            let boxMinY = box.rect.minY
+            let boxMaxY = box.rect.maxY
 
-        // Clamp the values so they never go outside the depth buffer array
-        let clampedMinX = max(depthMinX, 0)
-        let clampedMaxX = min(depthMaxX, Int(width) - 1)
-        let clampedMinY = max(depthMinY, 0)
-        let clampedMaxY = min(depthMaxY, Int(height) - 1)
-        var count: Float16 = 0
-        var totalDepth: Float16 = 0
-        
-        // Collect all depth samples from the bounding box
-        var depthSamples = [Float16]()
-        for yVal in clampedMinY...clampedMaxY {
-            for xVal in clampedMinX...clampedMaxX {
-                let depthIndex = yVal * Int(width) + xVal
-                depthSamples.append(baseAddress[depthIndex])
-                totalDepth += baseAddress[yVal * Int(width) + xVal]
-                count += 1
-            }
-        }
-        var invDepthSum: Float32 = 0        // sum of (1 / disparity) = metres
-        var validCount = 0
+            // Convert from screen coordinates to depth-map coordinates
+            let depthMinX = Int((boxMinX / screenRect.width) * CGFloat(width))
+            let depthMaxX = Int((boxMaxX / screenRect.width) * CGFloat(width))
+            let depthMinY = Int((boxMinY / screenRect.height) * CGFloat(height))
+            let depthMaxY = Int((boxMaxY / screenRect.height) * CGFloat(height))
 
-        for raw in depthSamples {
-            if raw > 0 {                    // skip invalid / zero disparities
-                invDepthSum += 1.0 / Float32(raw)   // convert to metres first
-                validCount += 1
-            }
-        }
+            // Clamp the values so they never go outside the depth buffer array
+            let clampedMinX = max(depthMinX, 0)
+            let clampedMaxX = min(depthMaxX, Int(width) - 1)
+            let clampedMinY = max(depthMinY, 0)
+            let clampedMaxY = min(depthMaxY, Int(height) - 1)
 
-
-        let medianDepth = self.findMedian(distances: depthSamples)
-        
-        //Removes outliers.
-        guard medianDepth > 0.2 && medianDepth < 8.0 else {
-            CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
-    return
-}
-         // This inverts the depth value as the distance is inversed naturally
-        //let correctedDepth: Float16 = medianDepth > 0 ? 1.0 / medianDepth : 0
-        //Replaces let statement above.
-        let correctedDepth: Float16 = medianDepth
-        // This inverts the depth value as the distance is inversed naturally
-        // Use correctedDepth to then calculate the depth of the object relative to user
-        stress = self.updateDepth(correctedDepth)
-        CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
-        DispatchQueue.main.async {
-            let newDetection = DetectionOutput(objcetName: self.objectName, distance: correctedDepth, corridorPosition: self.corridorPosition, id: self.objectIDD, vert: self.vert)
-            if recentDetections.count > 5 {
-                recentDetections.removeFirst()
-            }
-            recentDetections.append(newDetection)
-            var frequency: [String: Int] = [ :]
-            var simplifiedDetection: [Float16] = []
-            //Finds the string that appears the most
-            for detection in recentDetections {
-                frequency[detection.objcetName, default: 0] += 1
-            }
-            //let sortedFrequency = frequency.sorted(by: {$0.value < $1.value})
-            //let commonLabel = sortedFrequency[0].key
-            let sortedFrequency = frequency.sorted(by: {$0.value > $1.value})
-            let commonLabel = sortedFrequency.first?.key ?? self.objectName
-            var totalDistance: Float16 = 0
-            var finalCount: Float16 = 0
-            for detection in recentDetections {
-                if detection.objcetName == commonLabel {
-                    totalDistance = detection.distance
-                    finalCount += 1
-                    simplifiedDetection.append(detection.distance)
-                    self.corridorPosition = detection.corridorPosition //gets the last, and most accuract angle of the common object
-                    self.objectIDD = detection.id
+            var depthSamples = [Float16]()
+            for yVal in clampedMinY...clampedMaxY {
+                for xVal in clampedMinX...clampedMaxX {
+                    let depthIndex = yVal * Int(width) + xVal
+                    depthSamples.append(baseAddress[depthIndex])
                 }
             }
-//            self.objectDistance = self.findMedian(distances: simplifiedDetection)
-            self.objectDistance = finalCount > 0 ? totalDistance / Float16(finalCount) : 0
-            self.objectName = commonLabel
 
-            // Get XY coords; Functionality unused as of now, but may be needed in future development
-            // let objectCoords = DetectionUtils.polarToCartesian(distance: Float(self.objectDistance), direction: self.angle)
+            let medianDepth = self.findMedian(distances: depthSamples)
 
-            let objectDetected = DetectedObject(objName: self.objectName, distance: self.objectDistance, corridorPosition: self.corridorPosition, vert: self.vert)
-            let block = DecisionBlock(detectedObject: objectDetected)
-            let objectThreatLevel = block.computeThreatLevel(for: objectDetected)
-            let processedObject = ProcessedObject(objName: self.objectName, distance: self.objectDistance, corridorPosition: self.corridorPosition, vert: self.vert, threatLevel: objectThreatLevel)
-            block.processDetectedObjects(processed: processedObject)
+            // Remove outliers for this box.
+            guard medianDepth > 0.2 && medianDepth < 8.0 else {
+                continue
+            }
+
+            perBoxDetections.append((box: box, medianDepth: medianDepth))
+
+            let distanceFloat = Float(medianDepth)
+            if distanceFloat < minDistanceForStress {
+                minDistanceForStress = distanceFloat
+                closestDepthForStress = medianDepth
+            }
+        }
+
+        // If none of the boxes produced a valid median depth, bail out.
+        guard !perBoxDetections.isEmpty else {
+            CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
+            return
+        }
+
+        // Use the closest valid detection to drive the stress indicator.
+        stress = self.updateDepth(closestDepthForStress)
+        CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
+        DispatchQueue.main.async {
+            // For each detection with a valid median depth, compute and enqueue its threat.
+            for (box, medianDepth) in perBoxDetections {
+                self.boxCenter = CGPoint(x: box.rect.midX, y: box.rect.midY)
+                self.objectName = box.name
+                self.objectCoordinates = box.rect
+                self.confidence = box.score
+                self.corridorPosition = box.direction
+                self.objectIDD = box.classIndex
+                self.vert = box.vert
+                self.objectDistance = medianDepth
+
+                let objectDetected = DetectedObject(
+                    objName: self.objectName,
+                    distance: self.objectDistance,
+                    corridorPosition: self.corridorPosition,
+                    vert: self.vert,
+                    confidence: self.confidence
+                )
+                let block = DecisionBlock(detectedObject: objectDetected)
+                let objectThreatLevel = block.computeThreatLevel(for: objectDetected)
+                let processedObject = ProcessedObject(
+                    objName: self.objectName,
+                    distance: self.objectDistance,
+                    corridorPosition: self.corridorPosition,
+                    vert: self.vert,
+                    threatLevel: objectThreatLevel
+                )
+                block.processDetectedObjects(processed: processedObject)
+            }
 
             //let audioOutput = AudioQueue.popHighestPriorityObject(threshold: 1)
 //            if audioOutput?.threatLevel ?? 0 > 1{
