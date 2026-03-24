@@ -287,25 +287,7 @@ extension FrameHandler: AVCaptureDataOutputSynchronizerDelegate {
             CVPixelBufferGetBaseAddress(depthMap),
             to: UnsafeMutablePointer<Float16>.self
         )
-//        let centerX = Float(CGFloat(width) * (boxCenter.x / screenRect.width))
-//        let centerY = Float(CGFloat(height) * (boxCenter.y / screenRect.height))
-//        let windowSize = 100
-//        //Max and min ensure that when the bounty box is far left or far right of screen we do not get nevative value or values taht exceed the width
-//        let leftX = max(centerX - Float(windowSize), 0)
-//        let rightX = min(centerX + Float(windowSize), width - 1)
-//        let bottomY = max(centerY - Float(windowSize), 0)
-//        let topY = min(centerY + Float(windowSize), width - 1)
-////        var totalDepth: Float16 = 0
-//        var count = 0
-//        var depthSamples = [Float16]()
-//        //For each X and Y value find the depth and add it to a list to find the median value
-//        for yVal in Int(bottomY)...Int(topY) {
-//            for xVal in Int(leftX)...Int(rightX){
-//                depthSamples.append(baseAddress[yVal * Int(width) + xVal])
-////                totalDepth += baseAddress[y * Int(width) + x]
-//                count += 1
-//            }
-//        }
+
         // Pre-compute median depths for each bounding box
         var perBoxDetections: [(box: BoundingBox, medianDepth: Float16)] = []
         var closestDepthForStress: Float16 = 0
@@ -361,10 +343,11 @@ extension FrameHandler: AVCaptureDataOutputSynchronizerDelegate {
         }
 
         // Use the closest valid detection to drive the stress indicator.
-        stress = self.updateDepth(closestDepthForStress)
         CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
-        DispatchQueue.main.async {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
             // For each detection with a valid median depth, compute and enqueue its threat.
+            self.stress = self.updateDepth(closestDepthForStress)
             for (box, medianDepth) in perBoxDetections {
                 self.boxCenter = CGPoint(x: box.rect.midX, y: box.rect.midY)
                 self.objectName = box.name
@@ -374,6 +357,7 @@ extension FrameHandler: AVCaptureDataOutputSynchronizerDelegate {
                 self.objectIDD = box.classIndex
                 self.vert = box.vert
                 self.objectDistance = medianDepth
+                
 
                 let objectDetected = DetectedObject(
                     objName: self.objectName,
