@@ -7,12 +7,12 @@
 
 import Foundation
 
-struct ThreatLevelConfigV3 {
+struct ThreatLevelConfigV3{
     static let corridorPosition: [String: Int] = [
-        "Center": 10,
-        "Left": 5,
-        "Right": 3,
-        "Outside": 0
+        "Center": 10,  // Directly Ahead
+        "Left": 7,     // Left of the Corridor - slightly more important
+        "Right": 5,    // Right of the Corridor
+        "Outside": 0   // Outside the main walking corridor
     ]
 
     // Setting up semi-arbitrary values just to run through the tree
