@@ -51,6 +51,7 @@ extension AudioQueueVertex{
 
 class AudioQueue {
     public static var queue = Heap<AudioQueueVertex>()
+    
 
     static func addToHeap(_ processedObject: ProcessedObject) {
         let newVertex = AudioQueueVertex(
@@ -68,13 +69,14 @@ class AudioQueue {
     }
 
     static func popHighestPriorityObject(threshold: Float16) -> AudioQueueVertex? {
-        guard let candidate = queue.popMin() else{
-            return nil
+            guard let candidate = queue.popMin() else {
+                return nil
+            }
+            
+            if candidate.threatLevel >= threshold {
+                return candidate
+            } else {
+                return nil
+            }
         }
-        if candidate.threatLevel >= threshold{
-            return candidate
-        } else {
-            return nil
-        }
-    }
 }

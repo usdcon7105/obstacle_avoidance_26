@@ -6,7 +6,11 @@ import AVFoundation
 import Foundation
 import CoreImage
 import Vision
-class FrameHandler: NSObject, ObservableObject {
+import RealityKit
+import UIKit
+import ARKit
+
+class FrameHandler: NSObject, ObservableObject, ARSessionDelegate {
     enum ConfigurationError: Error {
         case lidarDeviceUnavailable
         case requiredFormatUnavailable
@@ -16,17 +20,17 @@ class FrameHandler: NSObject, ObservableObject {
     @Published var objectDistance: Float16 = 0.0
     @Published var corridorGeometry: CorridorGeometry? = nil // represents the area created by the corridor
     // Initializing variables related to capturing image.
-    private var permissionGranted = true
-    public let captureSession = AVCaptureSession()
+    public var permissionGranted = true
+    //    public let captureSession = AVCaptureSession()
+    public let arSession = ARSession()
     private let sessionQueue = DispatchQueue(label: "sessionQueue")
+    private var currentDepthMap: CVPixelBuffer? = nil
     private let context = CIContext()
     private var requests = [VNRequest]() // To hold detection requests
-    private var detectionLayer: CALayer! = nil
-    public var depthDataOutput: AVCaptureDepthDataOutput!
-    public var videoDataOutput: AVCaptureVideoDataOutput!
-    public var outputVideoSync: AVCaptureDataOutputSynchronizer!
+    public var detectionLayer: CALayer! = nil
     public let preferredWidthResolution = 1920
-    public var sessionConfigured = false
+    private var sessionConfigured = false
+    public var isProcessingFrame = false
     public var boxCoordinates: [CGRect] = []
     public var boxCenter = CGPoint(x: 0, y: 0)
     public var objectName: String = ""
@@ -35,42 +39,34 @@ class FrameHandler: NSObject, ObservableObject {
     public var confidence: Float = 0.0
     public var corridorPosition: String = ""
     public var vert: String = ""
-    public var objectIDD: Int = -1
     private var recentDetections: [DetectionOutput] = []
     public var maxDepth: Float = 12.0
     @Published var stress: CGFloat = 0.0
-//    public var middlePoint: (Int, Int) = ()
     var screenRect: CGRect!
     override init() {
         super.init()
         self.checkPermission()
         // Initialize screenRect here before setting up the capture session and detector
         self.screenRect = UIScreen.main.bounds
-//        sessionQueue.async { [unowned self] in
-////            self.setupCaptureSession()
-////            self.captureSession.startRunning()
-////            self.setupDetector()
-//        }
+        
     }
     func stopCamera() {
-//        captureSession.stopRunning()
-        if captureSession.isRunning {
-            captureSession.stopRunning()
-        }
+        arSession.pause()
     }
+    
     func startCamera() {
-//        CameraSetup.setupCaptureSession(frameHandler: self)
-//        captureSession.startRunning() // this should run in a background thread
-//        setupDetector()
-        if !sessionConfigured {
-              CameraSetup.setupCaptureSession(frameHandler: self)
-              sessionConfigured = true
-          }
-          if !captureSession.isRunning {
-              captureSession.startRunning()
-          }
-          setupDetector()
+        // Start ARKit session
+        let config = ARWorldTrackingConfiguration()
+        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth){
+            config.frameSemantics.insert(.sceneDepth)
+            arSession.delegate = self
+            arSession.delegateQueue = sessionQueue
+            arSession.run(config)
+        }
+        setupDetector()
+        sessionConfigured = true
     }
+    
     func setupDetector() {
         guard let modelURL = Bundle.main.url(forResource: "YOLOv3Tiny", withExtension: "mlmodelc") else {
             print("Error: Model file not found")
@@ -79,23 +75,121 @@ class FrameHandler: NSObject, ObservableObject {
         do {
             let visionModel = try VNCoreMLModel(for: MLModel(contentsOf: modelURL))
             let objectRecognition = VNCoreMLRequest(model: visionModel,
-                                                    completionHandler: detectionDidComplete)
+                                                    completionHandler: self.detectionDidComplete)
             self.requests = [objectRecognition]
         } catch let error {
             print("Error loading Core ML model: \(error)")
         }
     }
     func detectionDidComplete(request: VNRequest, error: Error?) {
-        DispatchQueue.main.async {
-            if let results = request.results {
-                /* print("Detection Results:", results) */ // Check detection results
-                self.extractDetections(results)
-
-                /**commented out since the v8 decoder is not yet functional, **/
-                //self.handleRawModelOutput(from: results)
+        // Always unlock the pipeline when we are done so the camera doesn't freeze
+        defer { self.isProcessingFrame = false }
+        
+        guard let results = request.results else { return }
+        
+        // Process the 2D bounding boxes (Your existing logic)
+        self.extractDetections(results)
+        
+        // Calculate the 3D distance using the depth map we saved earlier
+        self.calculateDistanceAndThreat()
+    }
+    
+    func calculateDistanceAndThreat() {
+        // Grab the depth map we temporarily saved in session(_:didUpdate:)
+        guard let depthMap = self.currentDepthMap else { return }
+        
+        // Find the most confident bounding box to focus on
+        guard let largestBox = self.boundingBoxes.max(by: { $0.score < $1.score }) else { return }
+        
+        // Lock the depth map in memory so we can safely read its pixels
+        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) } // Unlocks automatically when the function finishes
+        
+        let width = CVPixelBufferGetWidth(depthMap)
+        let height = CVPixelBufferGetHeight(depthMap)
+        
+        // Convert the 2D screen coordinates of the box into the depth map's resolution
+        let depthMinX = Int((largestBox.rect.minX / screenRect.width) * CGFloat(width))
+        let depthMaxX = Int((largestBox.rect.maxX / screenRect.width) * CGFloat(width))
+        let depthMinY = Int((largestBox.rect.minY / screenRect.height) * CGFloat(height))
+        let depthMaxY = Int((largestBox.rect.maxY / screenRect.height) * CGFloat(height))
+        
+        // Clamp values to prevent crashing if the bounding box goes slightly off-screen
+        let clampedMinX = max(depthMinX, 0)
+        let clampedMaxX = min(depthMaxX, Int(width) - 1)
+        let clampedMinY = max(depthMinY, 0)
+        let clampedMaxY = min(depthMaxY, Int(height) - 1)
+        
+        // Read the actual memory addresses to get the depth values
+        let baseAddress = unsafeBitCast(CVPixelBufferGetBaseAddress(depthMap), to: UnsafeMutablePointer<Float16>.self)
+        var depthSamples = [Float16]()
+        
+        // Loop through every pixel inside the bounding box and grab its depth in meters
+        for yVal in clampedMinY...clampedMaxY {
+            for xVal in clampedMinX...clampedMaxX {
+                let depthIndex = yVal * Int(width) + xVal
+                depthSamples.append(baseAddress[depthIndex])
             }
         }
+        
+        // Use your existing median function to filter out noise
+        let medianDepth = self.findMedian(distances: depthSamples)
+        
+        // Ignore crazy outliers (closer than 0.2m or further than 8.0m)
+        guard medianDepth > 0.2 && medianDepth < 8.0 else { return }
+        
+        // 4. Update the UI and Threat logic (Must be on the Main Thread!)
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            
+            // Update your published state variables
+            self.objectDistance = medianDepth
+            self.stress = self.updateDepth(medianDepth)
+            self.objectName = largestBox.name
+            self.corridorPosition = largestBox.direction
+            self.vert = largestBox.vert
+            
+            // Feed it into your DecisionBlock threat assessment
+            let objectDetected = DetectedObject(objName: self.objectName,
+                                                distance: self.objectDistance,
+                                                corridorPosition: self.corridorPosition,
+                                                vert: self.vert)
+            
+            let block = DecisionBlock(detectedObject: objectDetected)
+            let objectThreatLevel = block.computeThreatLevel(for: objectDetected)
+            
+            let processedObject = ProcessedObject(objName: self.objectName,
+                                                  distance: self.objectDistance,
+                                                  corridorPosition: self.corridorPosition,
+                                                  vert: self.vert,
+                                                  threatLevel: objectThreatLevel)
+            
+            block.processDetectedObjects(processed: processedObject)
+        }
     }
+    //New function, replaces commented one above - Bilal.
+    func findMedian(distances: [Float16]) -> Float16 {
+        let filtered = distances.filter { $0 > 0 && !$0.isNaN }
+        guard filtered.count > 0 else { return 0 }
+        
+        let sorted = filtered.sorted()
+        let count = sorted.count
+        
+        if count % 2 == 1 {
+            return sorted[count / 2]
+        } else {
+            return (sorted[count/2 - 1] + sorted[count/2]) / 2
+        }
+    }
+    
+    func updateDepth(_ z: Float16) -> CGFloat {
+        let d = Float(z)                 // convert once
+        let maxD = Float(maxDepth)       // ensure same type
+        
+        let normalized = max(0, min(1, (1 - (d / maxD))))
+        return CGFloat(normalized)
+    }
+    
     private func createBoundingBoxes(from observation: VNRecognizedObjectObservation, screenRect: CGRect) -> [BoundingBox] {
         var boxes: [BoundingBox] = []
         for label in observation.labels {
@@ -127,41 +221,38 @@ class FrameHandler: NSObject, ObservableObject {
                     vert: verticalLocation
                 )
                 boxes.append(box)
-
+                
             }
-
+            
         }
         return boxes
     }
-
+    
     /**handleRawModelOutout takes the raw tensors returned by the YOLOV8 model and puts them in a suitable format
-       for our NMSHandler function.
-         **/
+     for our NMSHandler function.
+     **/
     func handleRawModelOutput(from results: [VNObservation]){
         for result in results{
-
+            
             if let observation = result as? VNCoreMLFeatureValueObservation,
                let multiArray = observation.featureValue.multiArrayValue{
                 print("name???: ",observation.featureName)
                 let decodedBoxes = YOLODecoder.decodeOutput(multiArray: multiArray, confidenceThreshold: 0.5)
                 let filteredIndices = nonMaxSuppressionMultiClass(
-                                numClasses: YOLODecoder.labels.count,
-                                boundingBoxes: decodedBoxes,
-                                scoreThreshold: 0.5,
-                                iouThreshold: 0.4,
-                                maxPerClass: 5,
-                                maxTotal: 20
-                            )
+                    numClasses: YOLODecoder.labels.count,
+                    boundingBoxes: decodedBoxes,
+                    scoreThreshold: 0.5,
+                    iouThreshold: 0.4,
+                    maxPerClass: 5,
+                    maxTotal: 20
+                )
                 let filteredBoxes = filteredIndices.map { decodedBoxes[$0] }
                 self.boundingBoxes = filteredBoxes
-
-                //let nmsBoxes = NMSHandler.performNMS(on: decodedBoxes)
-                //self.boundingBoxes = nmsBoxes
             }
         }
     }
-
-
+    
+    
     func extractDetections(_ results: [VNObservation]) {
         // Ensure screenRect is initialized
         guard let screenRect = self.screenRect else {
@@ -185,8 +276,6 @@ class FrameHandler: NSObject, ObservableObject {
                     let boxes = self?.createBoundingBoxes(from: observation, screenRect: screenRect)
                     if let boxes = boxes {
                         boundingBoxResults.append(contentsOf: boxes)
-                        // Uncommented debug prints remain preserved:
-                        // print("Bounding box: \(boxes)")
                     }
                 }
             }
@@ -200,6 +289,7 @@ class FrameHandler: NSObject, ObservableObject {
         let centerPercentage = (centerX / self.screenRect.width) * 100 // RDA
         return Int(centerPercentage * 360 / 100) // Simplified calculation for the angle // RDA
     }
+    
     func updateLayers() {
         detectionLayer?.frame = CGRect(
             x: 0,
@@ -208,6 +298,39 @@ class FrameHandler: NSObject, ObservableObject {
             height: screenRect.size.height
         )
     }
+    
+    func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        guard !isProcessingFrame else { return }
+        isProcessingFrame = true
+
+        let pixelBuffer = frame.capturedImage
+
+        guard let depthMap = frame.sceneDepth?.depthMap else {
+            isProcessingFrame = false
+            return
+        }
+
+        self.currentDepthMap = depthMap
+
+        sessionQueue.async {
+            let requestHandler = VNImageRequestHandler(
+                cvPixelBuffer: pixelBuffer,
+                orientation: .right,
+                options: [:]
+            )
+
+            do {
+                try requestHandler.perform(self.requests)
+            } catch {
+                print("Vision failed: \(error)")
+                DispatchQueue.main.async {
+                    self.isProcessingFrame = false
+                }
+            }
+        }
+    }
+  
+    
     func drawBoundingBox(_ bounds: CGRect) -> CALayer {
         let boxLayer = CALayer()
         if bounds.isEmpty {
@@ -220,37 +343,21 @@ class FrameHandler: NSObject, ObservableObject {
     // Unavoidable as this is integral to Apple infrastructure
     func checkPermission() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
-        case .authorized: // The user has previously granted access to the camera.
+        case .authorized:
+            // The user has already given permission in the past.
             self.permissionGranted = true
-        case .notDetermined: // The user has not yet been asked for camera access.
-            self.requestPermission()
-        // Combine the two other cases into the default case
-        default:
-            self.permissionGranted = false
-        }
-    }
-    // Function that requests permission from the user to use the camera.
-    func requestPermission() {
-        // Strong reference not a problem here but might become one in the future.
-        AVCaptureDevice.requestAccess(for: .video) { [unowned self] granted in
-            self.permissionGranted = granted
-        }
-    }
-    // SwiftUI View for displaying camera output
-    struct DetectionView: View {
-        @ObservedObject var frameHandler: FrameHandler = FrameHandler()
-        var body: some View {
-            GeometryReader { geometry in
-                ZStack {
-                    CameraPreview(session: frameHandler.captureSession)
-                        .scaledToFill()
-                        .frame(width: geometry.size.width,
-                               height: geometry.size.height)
-                    BoundingBoxLayer(layer: frameHandler.detectionLayer)
-                        .frame(width: geometry.size.width,
-                               height: geometry.size.height)
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+                DispatchQueue.main.async {
+                    self?.permissionGranted = granted
                 }
             }
+        case .denied, .restricted:
+            // The user explicitly said "No" or has parental controls blocking the camera.
+            self.permissionGranted = false
+            
+        default:
+            self.permissionGranted = false
         }
     }
 }
@@ -444,81 +551,33 @@ extension FrameHandler: AVCaptureDataOutputSynchronizerDelegate {
     } else {
         return (sorted[count/2 - 1] + sorted[count/2]) / 2
     }
-}
     
-}
-extension FrameHandler: AVCaptureVideoDataOutputSampleBufferDelegate {
-    func captureOutput(_ output: AVCaptureOutput,
-                       didOutput sampleBuffer: CMSampleBuffer,
-                       from connection: AVCaptureConnection) {
-        guard let cgImage = imageFromSampleBuffer(sampleBuffer: sampleBuffer) else {
-            return
+    struct BoundingBoxLayer: UIViewRepresentable {
+        var layer: CALayer?
+        func makeUIView(context: Context) -> UIView {
+            let view = UIView()
+            return view
         }
-        // All UI updates should be performed on the main queue.
-        DispatchQueue.main.async { [unowned self] in
-            self.frame = cgImage
-            // self.boundingBoxes = []
-        }
-        do {
-            let requestHandler = VNImageRequestHandler(cgImage: cgImage) // Create an instance
-            try requestHandler.perform(self.requests) // Use the instance
-        } catch {
-            print(error)
+        func updateUIView(_ uiView: UIView, context: Context) {
+            guard let layer = layer else { return }
+            // Remove any existing sublayers
+            uiView.layer.sublayers?.forEach { $0.removeFromSuperlayer() }
+            // Scale the layer to match the size of the preview
+            let scale = UIScreen.main.scale
+            layer.frame = CGRect(
+                x: 0,
+                y: 0,
+                width: uiView.bounds.width * scale,
+                height: uiView.bounds.height * scale
+            )
+            uiView.layer.addSublayer(layer)  // Add the layer to the view's layer
         }
     }
-    // Private function that creates the sample buffer
-    private func imageFromSampleBuffer(sampleBuffer: CMSampleBuffer) -> CGImage? {
-        guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
-            return nil
-        }
-        let ciImage = CIImage(cvPixelBuffer: imageBuffer)
-        guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
-            return nil
-        }
-        return cgImage
+    struct DetectionOutput{
+        let objcetName: String
+        let distance: Float16
+        let corridorPosition: String
+        let id: Int
+        let vert: String
     }
-}
-// Everything below is me trying to figure out the display of bounding boxes on the screen
-struct CameraPreview: UIViewRepresentable {
-    var session: AVCaptureSession
-
-    func makeUIView(context: Context) -> some UIView {
-        let previewLayer = AVCaptureVideoPreviewLayer(session: session)
-        previewLayer.videoGravity = .resizeAspectFill
-        let view = UIView()
-        previewLayer.frame = view.layer.bounds
-        view.layer.addSublayer(previewLayer)
-        return view
-    }
-
-    func updateUIView(_ uiView: UIViewType, context: Context) {}
-    
-}
-struct BoundingBoxLayer: UIViewRepresentable {
-    var layer: CALayer?
-    func makeUIView(context: Context) -> UIView {
-        let view = UIView()
-        return view
-    }
-    func updateUIView(_ uiView: UIView, context: Context) {
-        guard let layer = layer else { return }
-        // Remove any existing sublayers
-        uiView.layer.sublayers?.forEach { $0.removeFromSuperlayer() }
-        // Scale the layer to match the size of the preview
-        let scale = UIScreen.main.scale
-        layer.frame = CGRect(
-            x: 0,
-            y: 0,
-            width: uiView.bounds.width * scale,
-            height: uiView.bounds.height * scale
-        )
-        uiView.layer.addSublayer(layer)  // Add the layer to the view's layer
-    }
-}
-struct DetectionOutput{
-    let objcetName: String
-    let distance: Float16
-    let corridorPosition: String
-    let id: Int
-    let vert: String
 }

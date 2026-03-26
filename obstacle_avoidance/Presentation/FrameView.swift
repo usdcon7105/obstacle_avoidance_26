@@ -73,14 +73,6 @@ struct FrameView: View {
 
     var body: some View {
         ZStack {
-            if let image = image {
-                Image(uiImage: UIImage(cgImage: image))
-                    .resizable()
-                    .scaledToFit()
-            } else {
-                Color.black
-            }
-
             // Overlay bounding boxes on the image
             // Notify user of object with the biggest bounding box
             if let biggestBox = boundingBoxes.max(by: { $0.rect.width < $1.rect.width }) {
@@ -97,6 +89,7 @@ struct FrameView: View {
             guard let audioOutput = AudioQueue.popHighestPriorityObject(threshold: 1) else {
                 return
             }
+            print(audioOutput)
             isSpeaking = true  // Claim immediately so the next tick can't pop and announce the same object
 
             if shouldSkipAnnouncement(objectName: audioOutput.objName, distance: audioOutput.distance) {
